@@ -45,19 +45,15 @@ class BratsNPZDataset(Dataset):
 
         presence = np.ones(len(modalities), np.float32)
 
-        # Modality dropout
         if self.augment:
             for i in range(len(modalities)):
                 if np.random.rand() < self.modality_dropout_prob:
                     imgs[i] = np.zeros_like(imgs[i])
                     presence[i] = 0.0
 
-        # Random flips
-        if self.augment:
             imgs = self.random_flip_3d(imgs)
             mask = self.random_flip_3d(mask)
 
-        # Presence channels
         presence_channels = np.stack([np.ones_like(mask) * p for p in presence], axis=0)
         inp = np.concatenate([imgs, presence_channels], axis=0)
 
@@ -146,9 +142,9 @@ def compute_metrics(pred, target, threshold=0.5, eps=1e-6):
 
 
 # ============================================================
-# Training + Evaluation Loop
+# Training + Evaluation Loop (with test metrics printed)
 # ============================================================
-def train_loop(train_loader, val_loader, model, device, epochs=10, lr=1e-3, save_dir="."):
+def train_and_test(train_loader, val_loader, test_loader, model, device, epochs=3, lr=1e-3, save_dir="."):
     save_dir = Path(save_dir)
     results_dir = save_dir / "results"
     results_dir.mkdir(exist_ok=True)
@@ -158,7 +154,11 @@ def train_loop(train_loader, val_loader, model, device, epochs=10, lr=1e-3, save
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
     best_dice = 0.0
 
-    history = {'train_loss': [], 'val_dice': [], 'val_iou': [], 'val_prec': [], 'val_rec': [], 'val_acc': []}
+    history = {
+        'train_loss': [],
+        'val_dice': [], 'val_iou': [], 'val_prec': [], 'val_rec': [], 'val_acc': [],
+        'test_dice': [], 'test_iou': [], 'test_prec': [], 'test_rec': [], 'test_acc': []
+    }
 
     for ep in range(1, epochs + 1):
         model.train()
@@ -181,7 +181,7 @@ def train_loop(train_loader, val_loader, model, device, epochs=10, lr=1e-3, save
         mean_train_loss = np.mean(train_losses)
         history['train_loss'].append(mean_train_loss)
 
-        # Validation
+        # ---------- Validation ----------
         model.eval()
         dices, ious, precs, recs, accs = [], [], [], [], []
         with torch.no_grad():
@@ -199,68 +199,51 @@ def train_loop(train_loader, val_loader, model, device, epochs=10, lr=1e-3, save
         history['val_rec'].append(mr)
         history['val_acc'].append(ma)
 
-        print(f"Epoch {ep}: Loss={mean_train_loss:.4f} | Dice={md:.4f} IoU={mi:.4f} Prec={mp:.4f} Rec={mr:.4f} Acc={ma:.4f}")
+        # ---------- Test Evaluation ----------
+        dices, ious, precs, recs, accs = [], [], [], [], []
+        with torch.no_grad():
+            for b in test_loader:
+                imgs = b['image'].to(device)
+                masks = b['mask'].to(device)
+                preds = torch.sigmoid(model(imgs))
+                d, i, p, r, a = compute_metrics(preds, masks)
+                dices.append(d); ious.append(i); precs.append(p); recs.append(r); accs.append(a)
+
+        td, ti, tp, tr, ta = map(np.mean, [dices, ious, precs, recs, accs])
+        history['test_dice'].append(td)
+        history['test_iou'].append(ti)
+        history['test_prec'].append(tp)
+        history['test_rec'].append(tr)
+        history['test_acc'].append(ta)
+
+        # ✅ Print all 5 test metrics clearly
+        print(f"\nEpoch {ep} Summary:")
+        print(f"  Train Loss   : {mean_train_loss:.4f}")
+        print(f"  Validation   → Dice={md:.4f}, IoU={mi:.4f}, Precision={mp:.4f}, Recall={mr:.4f}, Accuracy={ma:.4f}")
+        print(f"  Test         → Dice={td:.4f}, IoU={ti:.4f}, Precision={tp:.4f}, Recall={tr:.4f}, Accuracy={ta:.4f}\n")
 
         if md > best_dice:
             best_dice = md
             torch.save(model.state_dict(), results_dir / "best_model.pth")
             print("✔ Saved improved model")
 
-    # Training plots
-    metrics_to_plot = ["train_loss", "val_dice", "val_iou", "val_prec", "val_rec", "val_acc"]
+    # ---------- Plot Train vs Test ----------
+    metrics_to_plot = ["val_dice", "val_iou", "val_prec", "val_rec", "val_acc"]
     for key in metrics_to_plot:
         plt.figure()
-        plt.plot(history[key], label=key)
-        plt.title(key)
+        plt.plot(history[key], label=f"Validation {key.split('_')[1]}")
+        test_key = key.replace("val_", "test_")
+        plt.plot(history[test_key], label=f"Test {key.split('_')[1]}")
+        plt.title(f"{key.split('_')[1].upper()} Curve")
         plt.xlabel("Epoch")
-        plt.ylabel(key)
+        plt.ylabel(key.split('_')[1].capitalize())
         plt.legend()
         plt.grid(True)
-        plt.savefig(results_dir / f"{key}.png")
+        plt.savefig(results_dir / f"{key.replace('val_', '')}_train_test.png")
         plt.close()
 
-    print(f"✅ Training complete. Best Dice={best_dice:.4f}")
+    print(f"✅ Training + Testing complete. Best Validation Dice={best_dice:.4f}")
     print("All plots and model saved in:", results_dir)
-
-
-# ============================================================
-# Qualitative Visualization (2D slices)
-# ============================================================
-def visualize_predictions(model, test_loader, device, save_dir):
-    save_dir = Path(save_dir) / "results" / "test_visuals"
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    model.eval()
-    with torch.no_grad():
-        for b in tqdm(test_loader, desc="Visualizing test samples"):
-            imgs = b['image'].to(device)
-            masks = b['mask'].cpu().numpy()[0, 0]
-            name = b['name'][0]
-
-            preds = torch.sigmoid(model(imgs)).cpu().numpy()[0, 0]
-            t1 = imgs[0, 0].cpu().numpy()
-
-            slice_idx = t1.shape[0] // 2  # middle slice
-
-            fig, axs = plt.subplots(1, 4, figsize=(14, 4))
-            axs[0].imshow(t1[slice_idx], cmap='gray')
-            axs[0].set_title("T1")
-
-            axs[1].imshow(masks[slice_idx], cmap='Reds')
-            axs[1].set_title("Ground Truth")
-
-            axs[2].imshow(preds[slice_idx], cmap='Blues')
-            axs[2].set_title("Prediction")
-
-            axs[3].imshow(t1[slice_idx], cmap='gray')
-            axs[3].imshow(masks[slice_idx], cmap='Reds', alpha=0.3)
-            axs[3].imshow(preds[slice_idx], cmap='Blues', alpha=0.3)
-            axs[3].set_title("Overlay")
-
-            for ax in axs: ax.axis("off")
-            plt.tight_layout()
-            plt.savefig(save_dir / f"{name}_overlay.png")
-            plt.close()
 
 
 # ============================================================
@@ -271,23 +254,15 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 2
 
-    # Train/Val/Test Datasets (subset for now)
-    train_ds = BratsNPZDataset(base / "preprocessed_train", augment=True, modality_dropout_prob=0.2, limit=5)
-    val_ds = BratsNPZDataset(base / "preprocessed_validation", augment=False, limit=5)
-    test_ds = BratsNPZDataset(base / "preprocessed_test", augment=False, limit=5)
+    train_ds = BratsNPZDataset(base / "preprocessed_train", augment=True, modality_dropout_prob=0.2, limit=None)
+    val_ds = BratsNPZDataset(base / "preprocessed_validation", augment=False, limit=None)
+    test_ds = BratsNPZDataset(base / "preprocessed_test", augment=False, limit=None)
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     val_dl = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=1)
     test_dl = DataLoader(test_ds, batch_size=1, shuffle=False)
 
-    # Model setup
     in_ch = 6  # 3 modalities + 3 presence channels
     model = UNet3D(in_ch, base=16, out_channels=1)
 
-    # Training
-    train_loop(train_dl, val_dl, model, device, epochs=30, lr=1e-3, save_dir=base)
-
-    # Visualization on Test Data
-    model.load_state_dict(torch.load(base / "results" / "best_model.pth", map_location=device))
-    model.to(device)
-    visualize_predictions(model, test_dl, device, base)
+    train_and_test(train_dl, val_dl, test_dl, model, device, epochs=100, lr=1e-3, save_dir=base)
